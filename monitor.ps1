@@ -31,17 +31,22 @@ Add-Type -AssemblyName System.Windows.Forms # For MessageBox
 
 #region Prerequisite: Check and Install ThreadJob Module
 function Ensure-ThreadJobModule {
+    # --- ADDED: Force TLS 1.2 for web requests ---
+    # This is crucial for PS 5.1 on older systems to talk to modern servers (like NuGet)
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    # --- END ADDED SECTION ---
+
     if (-not (Get-Module -ListAvailable -Name ThreadJob)) {
         $message = "The required 'ThreadJob' module is not found.`n`nThis module is necessary for running high-performance, parallel web checks.`n`nDo you want to install it from the PowerShell Gallery (requires internet)?"
         $result = [System.Windows.Forms.MessageBox]::Show($message, "Missing Dependency", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
         
         if ($result -eq 'Yes') {
             try {
-                Write-Host "Installing 'ThreadJob' module for the current user..."
-                # Suppress progress bar for a cleaner console experience if run from there
-                $ProgressPreference = 'SilentlyContinue'
-                
-                # --- CORRECTED: Check for and install NuGet provider ---
+            # Check just the headers first. This is faster.
+            $response = Invoke-WebRequest -Uri $targetUri -Method Head -TimeoutSec 10 -SkipCertificateCheck
+            
+            if ($response.StatusCode -eq 200) {
+                $logSync.Log("`t[$server] SUCCESS: File found (HTTP 200).")
                 try {
                     # Get a list of *installed* package providers
                     $installedProviders = Get-PackageProvider | Select-Object -ExpandProperty Name
@@ -425,5 +430,7 @@ $form.Add_Closing({
 Write-Host "Starting File Replication Monitor GUI..."
 $form.ShowDialog() | Out-Null
 #endregion
+
+
 
 
