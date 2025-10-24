@@ -40,6 +40,23 @@ function Ensure-ThreadJobModule {
                 Write-Host "Installing 'ThreadJob' module for the current user..."
                 # Suppress progress bar for a cleaner console experience if run from there
                 $ProgressPreference = 'SilentlyContinue'
+                
+                # --- ADDED: Check for and install NuGet provider ---
+                try {
+                    if (-not (Get-PackageProvider -Name NuGet -ListAvailable)) {
+                        Write-Host "NuGet package provider not found. Installing it non-interactively..."
+                        # Install the provider for the current user, non-interactively
+                        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force
+                        Write-Host "NuGet provider installed."
+                    }
+                }
+                catch {
+                    $errorMsg = "Failed to install the 'NuGet' provider. Error: $_`n`nCannot proceed with module installation. Please check your internet connection and try again."
+                    [System.Windows.Forms.MessageBox]::Show($errorMsg, "Installation Failed", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                    return $false # Stop the function
+                }
+                # --- END ADDED SECTION ---
+
                 Install-Module -Name ThreadJob -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
                 Write-Host "'ThreadJob' module installed successfully."
                 # Import it for the current session
@@ -402,3 +419,4 @@ $form.Add_Closing({
 Write-Host "Starting File Replication Monitor GUI..."
 $form.ShowDialog() | Out-Null
 #endregion
+
