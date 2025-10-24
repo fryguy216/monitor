@@ -1,47 +1,80 @@
-#Requires -Version 5.1
-# No longer using #Requires for ThreadJob, as we will handle the dependency check manually.
+<#
+.SYNOPSIS
+    A PowerShell 5.1 compatible script with a GUI to monitor a source 
+    directory (including UNC paths) for file changes and verify replication
+    to a list of web servers via HTTP/HTTPS.
 
-param(
-    [string]$UNCPath = '\\FileServer\Share\Path',
-    [string]$WebServerUrls = @('http://webserver01', 'http://webserver02'),
-    [string]$FileFilter = '*.xml',
-    [string]$HashAlgorithm = 'SHA256'
-)
+.DESCRIPTION
+    This tool provides a WPF interface to:
+    1. Define a source path, file filter (*.xml, *.js, etc.), and a list of web servers.
+    2. Start a monitor that uses .NET FileSystemWatcher.
+    3. When a file is created, changed, or deleted, it logs the event.
+    4. It then starts parallel background jobs (using ThreadJob) to check the
+       replication status of that file on each web server.
+    5. It checks for file existence using an HTTP HEAD request and logs the status code.
+    6. All actions are logged to the main window.
+    7. It includes a check for the 'ThreadJob' module and will prompt for
+       installation if it's not found, as it is required for parallel checks.
 
-# --- Dependency Check for ThreadJob Module ---
-if (-not (Get-Module -ListAvailable -Name ThreadJob)) {
-    Write-Host "The 'ThreadJob' module is required for parallel operations but is not installed." -ForegroundColor Yellow
-    $prompt = Read-Host "Would you like to attempt to install it from the PowerShell Gallery? (Y/N)"
-    if ($prompt -match '^') {
-        try {
-            Write-Host "Installing 'ThreadJob' module for the current user. This may take a moment..." -ForegroundColor Green
-            # Install for the current user to avoid requiring admin rights
-            Install-Module -Name ThreadJob -Force -Scope CurrentUser
-            Write-Host "'ThreadJob' module installed successfully." -ForegroundColor Green
+.NOTES
+    Author: Gemini
+    Requires: PowerShell 5.1
+    Dependencies: 'ThreadJob' module (script will offer to install)
+#>
+
+#region Prerequisite: Add WPF and Windows Forms Assemblies
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Windows.Forms # For MessageBox
+#endregion
+
+#region Prerequisite: Check and Install ThreadJob Module
+function Ensure-ThreadJobModule {
+    if (-not (Get-Module -ListAvailable -Name ThreadJob)) {
+        $message = "The required 'ThreadJob' module is not found.`n`nThis module is necessary for running high-performance, parallel web checks.`n`nDo you want to install it from the PowerShell Gallery (requires internet)?"
+        $result = [System.Windows.Forms.MessageBox]::Show($message, "Missing Dependency", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+        
+        if ($result -eq 'Yes') {
+            try {
+                Write-Host "Installing 'ThreadJob' module for the current user..."
+                # Suppress progress bar for a cleaner console experience if run from there
+                $ProgressPreference = 'SilentlyContinue'
+                Install-Module -Name ThreadJob -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
+                Write-Host "'ThreadJob' module installed successfully."
+                # Import it for the current session
+                Import-Module ThreadJob
+            }
+            catch {
+                $errorMsg = "Failed to install 'ThreadJob' module. Error: $_`n`nScript will exit. Please install the module manually and try again."
+                [System.Windows.Forms.MessageBox]::Show($errorMsg, "Installation Failed", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                return $false
+            }
+            finally {
+                # Restore preference
+                $ProgressPreference = 'Continue'
+            }
         }
-        catch {
-            Write-Host "Error: Failed to install the 'ThreadJob' module." -ForegroundColor Red
-            Write-Host "Please ensure you have an internet connection and that your execution policy allows script installation." -ForegroundColor Red
-            Write-Host "You can try installing it manually by running: Install-Module -Name ThreadJob -Scope CurrentUser" -ForegroundColor Red
-            # Pause to allow the user to read the error before exiting.
-            Read-Host "Press Enter to exit."
-            exit
+        else {
+            [System.Windows.Forms.MessageBox]::Show("Script cannot run without the 'ThreadJob' module. Exiting.", "Dependency Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Exclamation)
+            return $false
         }
     }
-    else {
-        Write-Host "Installation declined. The script cannot continue without the 'ThreadJob' module." -ForegroundColor Red
-        Read-Host "Press Enter to exit."
-        exit
-    }
+    return $true
 }
 
-# --- ---
-# The UI is defined using XAML for a clean separation of presentation and logic.
-Add-Type -AssemblyName PresentationFramework
+# Run the dependency check. If it fails or user cancels, exit.
+if (-not (Ensure-ThreadJobModule)) {
+    # Exit the script cleanly if the dependency isn't met.
+    return
+}
+#endregion
+
+#region XAML GUI Definition
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="File Replication Monitor" Height="600" Width="950" WindowStartupLocation="CenterScreen">
+        Title="File Replication Monitor (PS 5.1)" Height="700" Width="800" MinHeight="450" MinWidth="600">
     <Grid Margin="10">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -50,233 +83,322 @@ Add-Type -AssemblyName PresentationFramework
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-
-        <StackPanel Grid.Row="0" Orientation="Vertical">
-            <Label Content="UNC Path to Monitor:"/>
-            <TextBox x:Name="UncPathTextBox" Text="$UNCPath"/>
+        
+        <!-- Configuration Section -->
+        <GroupBox Header="Configuration" Grid.Row="0" Padding="5">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                
+                <Label Content="_Source Path (UNC):" Grid.Row="0" Grid.Column="0" VerticalAlignment="Center" Target="{Binding ElementName=SourcePathBox}"/>
+                <TextBox x:Name="SourcePathBox" Grid.Row="0" Grid.Column="1" Margin="5" VerticalAlignment="Center" ToolTip="Enter the full directory path to monitor (e.g., \\server\share\content)"/>
+                
+                <Label Content="_File Filter:" Grid.Row="1" Grid.Column="0" VerticalAlignment="Center" Target="{Binding ElementName=FilterBox}"/>
+                <TextBox x:Name="FilterBox" Grid.Row="1" Grid.Column="1" Margin="5" VerticalAlignment="Center" Text="*.*" ToolTip="Enter the file pattern to watch (e.g., *.xml, *.js, data_*.dat)"/>
+                
+                <Label Content="_Web Servers (one per line):" Grid.Row="2" Grid.Column="0" VerticalAlignment="Top" Margin="0,5,0,0" Target="{Binding ElementName=ServerListBox}"/>
+                <TextBox x:Name="ServerListBox" Grid.Row="2" Grid.Column="1" Margin="5" Height="100" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" ToolTip="Enter server base URLs (e.g., http://web01.example.com, https://web02.example.com)"/>
+            </Grid>
+        </GroupBox>
+        
+        <!-- Control Buttons -->
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,10,0,0">
+            <Button x:Name="StartButton" Content="Start Monitoring" Width="150" Height="30" Margin="5" Background="#FF4CAF50" Foreground="White" FontWeight="Bold"/>
+            <Button x:Name="StopButton" Content="Stop Monitoring" Width="150" Height="30" Margin="5" IsEnabled="False" Background="#FFF44336" Foreground="White" FontWeight="Bold"/>
         </StackPanel>
-
-        <StackPanel Grid.Row="1" Orientation="Vertical" Margin="0,10,0,0">
-            <Label Content="Web Server Base URLs (comma-separated):"/>
-            <TextBox x:Name="WebServersTextBox" Text="$($WebServerUrls -join ',')" TextWrapping="Wrap"/>
-        </StackPanel>
-
-        <Grid Grid.Row="2" Margin="0,10,0,0">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <StackPanel Grid.Column="0" Orientation="Vertical">
-                <Label Content="File Filter:"/>
-                <TextBox x:Name="FileFilterTextBox" Text="$FileFilter"/>
-            </StackPanel>
-            <Button x:Name="StartButton" Content="Start Monitoring" Grid.Column="1" Width="120" Height="30" Margin="10,0,0,0" VerticalAlignment="Bottom"/>
-            <Button x:Name="StopButton" Content="Stop Monitoring" Grid.Column="2" Width="120" Height="30" Margin="10,0,0,0" VerticalAlignment="Bottom" IsEnabled="False"/>
-        </Grid>
-
-        <DataGrid x:Name="LogDataGrid" Grid.Row="3" Margin="0,15,0,0" AutoGenerateColumns="False" IsReadOnly="True">
-            <DataGrid.Columns>
-                <DataGridTextColumn Header="Timestamp" Binding="{Binding Timestamp}" Width="150"/>
-                <DataGridTextColumn Header="File Path" Binding="{Binding FilePath}" Width="*"/>
-                <DataGridTextColumn Header="Server" Binding="{Binding Server}" Width="150"/>
-                <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="100"/>
-                <DataGridTextColumn Header="Details" Binding="{Binding Details}" Width="2*"/>
-            </DataGrid.Columns>
-        </DataGrid>
-
-        <StatusBar Grid.Row="4" Margin="0,5,0,0">
-            <StatusBarItem>
-                <TextBlock x:Name="StatusTextBlock" Text="Status: Stopped"/>
-            </StatusBarItem>
-        </StatusBar>
+        
+        <!-- Status Label -->
+        <Label x:Name="StatusLabel" Grid.Row="2" Content="Status: Stopped" HorizontalAlignment="Center" Margin="0,5,0,10" FontSize="14" FontWeight="Bold" Foreground="#FF888888"/>
+        
+        <!-- Log Output -->
+        <GroupBox Header="Event Log" Grid.Row="3" Padding="5">
+            <TextBox x:Name="LogBox" IsReadOnly="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" FontFamily="Consolas" FontSize="12" Background="#FFF3F3F3"/>
+        </GroupBox>
+        
+        <!-- Clear Log Button -->
+        <Button x:Name="ClearLogButton" Content="Clear Log" Grid.Row="4" Width="100" Height="25" Margin="0,10,0,0" HorizontalAlignment="Right"/>
     </Grid>
 </Window>
 "@
+#endregion
 
-# --- ---
-# Global variables are used to maintain state across different parts of the script,
-# including the UI thread and background jobs.
-
-# HttpClient Singleton: A single instance is created and reused for all web requests
-# to ensure performance and avoid socket exhaustion.
-$global:HttpClient = New-Object System.Net.Http.HttpClient
-
-# FileSystemWatcher: The core monitoring object.
-$global:FileSystemWatcher = $null
-
-# Log Collection: A synchronized ArrayList is used for thread-safe updates to the GUI's DataGrid.
-$global:LogCollection =::Synchronized(@(New-Object System.Collections.ArrayList))
-
-# --- ---
-
-function Add-LogEntry {
-    param(
-        [string]$FilePath,
-        [string]$Server,
-        [string]$Status,
-        [string]$Details
-    )
-    # The dispatcher is used to ensure UI updates happen on the main UI thread.
-    $logEntry = [pscustomobject]@{
-        Timestamp   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-        FilePath    = $FilePath
-        Server      = $Server
-        Status      = $Status
-        Details     = $Details
-    }
-    $script:Window.Dispatcher.InvokeAsync({
-        $global:LogCollection.Insert(0, $logEntry)
-    }) | Out-Null
-}
-
-function Invoke-Verification {
-    param(
-        [string]$SourceFullPath,
-        [string]$WebServerUrl,
-        [string]$HashAlgorithm
-    )
-
-    $fileName =::GetFileName($SourceFullPath)
-    $remoteUrl = "$WebServerUrl/$fileName"
-    
-    try {
-        # Tier 1: Header Check (ETag)
-        Add-LogEntry -FilePath $fileName -Server $WebServerUrl -Status "Verifying" -Details "Performing HEAD request..."
-        
-        $headRequest =::new(::Head, $remoteUrl)
-        $headResponse = $global:HttpClient.SendAsync($headRequest).GetAwaiter().GetResult()
-
-        if (-not $headResponse.IsSuccessStatusCode) {
-            Add-LogEntry -FilePath $fileName -Server $WebServerUrl -Status "Failed" -Details "HTTP $($headResponse.StatusCode.value__): File not found or inaccessible."
-            return
-        }
-
-        $remoteETag = $headResponse.Headers.ETag.Tag
-        $sourceHash = (Get-FileHash -Path $SourceFullPath -Algorithm $HashAlgorithm).Hash
-        
-        # Note: ETag format can be "hash" or W/"hash". We compare the core hash part.
-        if ($remoteETag -and $remoteETag.Trim('"') -eq $sourceHash) {
-            Add-LogEntry -FilePath $fileName -Server $WebServerUrl -Status "Success" -Details "ETag matches source hash."
-            return
-        }
-
-        # Tier 2: In-Memory Hash Comparison
-        Add-LogEntry -FilePath $fileName -Server $WebServerUrl -Status "Verifying" -Details "ETag mismatch or absent. Performing full hash comparison..."
-        
-        $getResponse = $global:HttpClient.GetAsync($remoteUrl).GetAwaiter().GetResult()
-        if (-not $getResponse.IsSuccessStatusCode) {
-            Add-LogEntry -FilePath $fileName -Server $WebServerUrl -Status "Failed" -Details "HTTP $($getResponse.StatusCode.value__): Failed to download file for hashing."
-            return
-        }
-
-        $remoteBytes = $getResponse.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-        $memoryStream = New-Object System.IO.MemoryStream(,$remoteBytes)
-        $remoteHash = (Get-FileHash -InputStream $memoryStream -Algorithm $HashAlgorithm).Hash
-        $memoryStream.Close()
-
-        if ($remoteHash -eq $sourceHash) {
-            Add-LogEntry -FilePath $fileName -Server $WebServerUrl -Status "Success" -Details "Hash matches source file ($HashAlgorithm)."
-        } else {
-            Add-LogEntry -FilePath $fileName -Server $WebServerUrl -Status "Failed" -Details "Hash mismatch. Source: $sourceHash, Remote: $remoteHash"
-        }
-    }
-    catch {
-        Add-LogEntry -FilePath $fileName -Server $WebServerUrl -Status "Error" -Details "Exception during verification: $($_.Exception.Message)"
-    }
-}
-
-function Start-Monitoring {
-    param(
-        [string]$Path,
-        [string]$Servers,
-        [string]$Filter
-    )
-    
-    if (-not (Test-Path -Path $Path -PathType Container)) {
-      ::Show("The specified UNC path does not exist or is not accessible.", "Error", "OK", "Error")
-        return
-    }
-
-    $global:FileSystemWatcher = New-Object System.IO.FileSystemWatcher -Property @{
-        Path                  = $Path
-        Filter                = $Filter
-        NotifyFilter          = 'LastWrite, FileName'
-        IncludeSubdirectories = $false # Set to $true if needed
-    }
-
-    $action = {
-        $sourcePath = $Event.SourceEventArgs.FullPath
-        $servers = $using:Servers
-        $hashAlgo = $using:HashAlgorithm
-
-        Add-LogEntry -FilePath $sourcePath -Server "Monitor" -Status "Detected" -Details "File change detected. Starting verification..."
-
-        foreach ($server in $servers) {
-            Start-ThreadJob -ScriptBlock ${function:Invoke-Verification} -ArgumentList $sourcePath, $server, $hashAlgo
-        }
-    }
-
-    Register-ObjectEvent -InputObject $global:FileSystemWatcher -EventName Created -SourceIdentifier "FileCreated" -Action $action
-    Register-ObjectEvent -InputObject $global:FileSystemWatcher -EventName Changed -SourceIdentifier "FileChanged" -Action $action
-
-    $global:FileSystemWatcher.EnableRaisingEvents = $true
-    Add-LogEntry -FilePath $Path -Server "Monitor" -Status "Started" -Details "Monitoring for file changes."
-}
-
-function Stop-Monitoring {
-    if ($global:FileSystemWatcher) {
-        $global:FileSystemWatcher.EnableRaisingEvents = $false
-        Unregister-Event -SourceIdentifier "FileCreated" -ErrorAction SilentlyContinue
-        Unregister-Event -SourceIdentifier "FileChanged" -ErrorAction SilentlyContinue
-        $global:FileSystemWatcher.Dispose()
-        $global:FileSystemWatcher = $null
-        Add-LogEntry -FilePath "N/A" -Server "Monitor" -Status "Stopped" -Details "Monitoring has been stopped."
-    }
-}
-
-# --- ---
-
+#region Create and Link GUI Elements
 try {
-    $reader = (New-Object System.Xml.XmlNodeReader $xaml)
-    $script:Window =::Load($reader)
-
-    # Find and store references to all named controls
-    $controls = @{}
-    $xaml.Window.SelectNodes("//*[@x:Name]") | ForEach-Object {
-        $controls[$_.Name] = $script:Window.FindName($_.Name)
-    }
-
-    # Bind the DataGrid to the synchronized collection
-    $controls.LogDataGrid.ItemsSource = $global:LogCollection
-
-    # Attach event handlers to buttons
-    $controls.StartButton.add_Click({
-        $unc = $controls.UncPathTextBox.Text
-        $servers = $controls.WebServersTextBox.Text -split ',' | ForEach-Object { $_.Trim() }
-        $filter = $controls.FileFilterTextBox.Text
-
-        $controls.StartButton.IsEnabled = $false
-        $controls.StopButton.IsEnabled = $true
-        $controls.StatusTextBlock.Text = "Status: Monitoring..."
-        Start-Monitoring -Path $unc -Servers $servers -Filter $filter
-    })
-
-    $controls.StopButton.add_Click({
-        Stop-Monitoring
-        $controls.StartButton.IsEnabled = $true
-        $controls.StopButton.IsEnabled = $false
-        $controls.StatusTextBlock.Text = "Status: Stopped"
-    })
-
-    $script:Window.add_Closing({
-        Stop-Monitoring
-        $global:HttpClient.Dispose()
-    })
-
-    # Display the window
-    $null = $script:Window.ShowDialog()
+    # Create the XAML reader
+    $reader = New-Object System.Xml.XmlNodeReader $xaml
+    $form = [System.Windows.Markup.XamlReader]::Load($reader)
 }
 catch {
-  ::Show("An error occurred while initializing the GUI: $($_.Exception.Message)", "Fatal Error", "OK", "Error")
+    [System.Windows.Forms.MessageBox]::Show("Failed to load GUI: $_", "XAML Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    return
 }
+
+# Store controls in a hash table for easy access
+$controls = @{}
+$xaml.SelectNodes("//*[@x:Name]") | ForEach-Object {
+    $controls[$_.x_Name] = $form.FindName($_.x_Name)
+}
+
+# Create global variables to hold the watcher and event subscribers
+$global:fileWatcher = $null
+$global:eventSubscribers = @()
+#endregion
+
+#region Helper Functions
+# Helper to safely update the GUI from other threads
+function Write-Log {
+    param(
+        [string]$Message
+    )
+    
+    # This block ensures we are updating the GUI on its main thread
+    $controls.LogBox.Dispatcher.Invoke([Action]{
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $controls.LogBox.AppendText("[$timestamp] $Message`n")
+        $controls.LogBox.ScrollToEnd()
+    }, [System.Windows.Threading.DispatcherPriority]::Background)
+}
+
+# Helper to update the status label
+function Update-Status {
+    param(
+        [string]$Message,
+        [string]$Color
+    )
+    
+    $controls.StatusLabel.Dispatcher.Invoke([Action]{
+        $controls.StatusLabel.Content = "Status: $Message"
+        $controls.StatusLabel.Foreground = $Color
+    }, [System.Windows.Threading.DispatcherPriority]::Background)
+}
+#endregion
+
+#region Button: Start Monitoring
+$controls.StartButton.Add_Click({
+    # --- 1. Validate Input ---
+    $sourcePath = $controls.SourcePathBox.Text
+    $fileFilter = $controls.FilterBox.Text
+    $servers = $controls.ServerListBox.Text.Split([string[]]@("`r`n", "`n"), [StringSplitOptions]::RemoveEmptyEntries)
+    
+    if (-not (Test-Path -Path $sourcePath)) {
+        [System.Windows.Forms.MessageBox]::Show("The specified Source Path does not exist or is not accessible.", "Invalid Path", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        return
+    }
+    
+    if ($servers.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Please enter at least one web server URL.", "No Servers", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        return
+    }
+    
+    # Store server list in a global var for the event handler to access
+    $global:serverList = $servers
+    $global:sourcePath = $sourcePath
+
+    # --- 2. Configure FileSystemWatcher ---
+    try {
+        $global:fileWatcher = New-Object System.IO.FileSystemWatcher
+        $global:fileWatcher.Path = $sourcePath
+        $global:fileWatcher.Filter = $fileFilter
+        $global:fileWatcher.IncludeSubdirectories = $true
+        $global:fileWatcher.NotifyFilter = [System.IO.NotifyFilters]::FileName, [System.IO.NotifyFilters]::LastWrite
+        
+        # --- 3. Define the Action Block for Events ---
+        # This script block will be executed when a file event fires
+        $actionBlock = {
+            param($event)
+            
+            $eventType = $event.SourceEventArgs.ChangeType
+            $fullPath = $event.SourceEventArgs.FullPath
+            $fileName = $event.SourceEventArgs.Name
+            
+            Write-Log "EVENT: [$eventType] $fileName"
+            
+            # We need to get the server list and source path from the global scope
+            $serversToCheck = $global:serverList
+            $basePath = $global:sourcePath
+            
+            # Calculate the relative path for the web server
+            # e.g., \\server\share\css\style.css -> /css/style.css
+            $relativePath = $fullPath.Replace($basePath, "").Replace("\", "/")
+            if ($relativePath -notlike "/*") {
+                $relativePath = "/$relativePath"
+            }
+            
+            Write-Log "File: $relativePath. Starting replication check on $($serversToCheck.Count) server(s)..."
+            
+            # --- 4. Start Parallel Web Checks using ThreadJob ---
+            $job = Start-ThreadJob -ScriptBlock {
+                param($servers, $relPath, $fileEventType)
+                
+                $results = @()
+                
+                # This code runs in a separate thread
+                foreach ($server in $servers) {
+                    $uri = "$($server.TrimEnd('/'))$($relPath)"
+                    $result = @{
+                        Server = $server
+                        Uri = $uri
+                        StatusCode = $null
+                        Status = "Error"
+                    }
+                    
+                    try {
+                        # We use -Method Head for efficiency. We don't need the file content, just its status.
+                        # For 'Deleted' events, we expect a 404. For 'Created'/'Changed', we expect a 200.
+                        Invoke-WebRequest -Uri $uri -Method Head -TimeoutSec 10 -UseBasicParsing
+                        
+                        # If the request succeeds, it means a 2xx status (like 200 OK)
+                        $result.StatusCode = 200 # Note: $Error[0].Exception.Response.StatusCode is not available on success
+                        
+                        if ($fileEventType -eq 'Deleted') {
+                            $result.Status = "FAIL (File still exists)"
+                        } else {
+                            $result.Status = "OK (File exists)"
+                        }
+                    }
+                    catch {
+                        # If the request fails (e.g., 404, 500, timeout), the error is in $_
+                        $response = $_.Exception.Response
+                        if ($response) {
+                            $statusCode = [int]$response.StatusCode
+                            $result.StatusCode = $statusCode
+                            
+                            if ($fileEventType -eq 'Deleted' -and $statusCode -eq 404) {
+                                $result.Status = "OK (File deleted)"
+                            } elseif ($fileEventType -ne 'Deleted' -and $statusCode -eq 404) {
+                                $result.Status = "FAIL (File not found)"
+                            } else {
+                                $result.Status = "FAIL (HTTP $statusCode)"
+                            }
+                        } else {
+                            $result.Status = "FAIL (No response/Timeout)"
+                        }
+                    }
+                    $results += $result
+                }
+                return $results
+            } -ArgumentList $serversToCheck, $relativePath, $eventType
+            
+            # --- 5. Asynchronously Handle Job Completion ---
+            # We register an event on the job itself. This avoids blocking the GUI or the FileWatcher thread.
+            $jobEvent = Register-ObjectEvent -InputObject $job -EventName StateChanged -Action {
+                param($jobData)
+
+                # Check if the job that fired the event is 'Completed'
+                if ($jobData.SourceEventArgs.JobStateInfo.State -eq [System.Management.Automation.JobState]::Completed) {
+                    $completedJob = $jobData.Sender
+                    $results = Receive-Job -Job $completedJob
+                    
+                    Write-Log "CHECK COMPLETE for $($jobData.SourceEventArgs.JobStateInfo.Name):"
+                    
+                    foreach ($res in $results) {
+                        Write-Log "  -> $($res.Server): $($res.Status) (URI: $($res.Uri))"
+                    }
+                    
+                    # Clean up the event and job
+                    Unregister-Event -SubscriptionId $jobData.SubscriptionId
+                    Remove-Job -Job $completedJob
+                }
+                # Also handle failed jobs
+                elseif ($jobData.SourceEventArgs.JobStateInfo.State -eq [System.Management.Automation.JobState]::Failed) {
+                    $failedJob = $jobData.Sender
+                    Write-Log "ERROR: Web check job failed: $($failedJob.JobStateInfo.Reason.Message)"
+                    
+                    Unregister-Event -SubscriptionId $jobData.SubscriptionId
+                    Remove-Job -Job $failedJob
+                }
+            }
+            # Add this job's event subscriber to the global list for cleanup
+            $global:eventSubscribers += $jobEvent
+        }
+        
+        # --- 6. Register Events ---
+        $eventsToWatch = @("Created", "Changed", "Deleted", "Renamed")
+        foreach ($event in $eventsToWatch) {
+            $subscriber = Register-ObjectEvent -InputObject $global:fileWatcher -EventName $event -Action $actionBlock
+            $global:eventSubscribers += $subscriber
+        }
+        
+        # --- 7. Start Monitoring ---
+        $global:fileWatcher.EnableRaisingEvents = $true
+        
+        # Update GUI state
+        $controls.StartButton.IsEnabled = $false
+        $controls.StopButton.IsEnabled = $true
+        $controls.SourcePathBox.IsReadOnly = $true
+        $controls.FilterBox.IsReadOnly = $true
+        $controls.ServerListBox.IsReadOnly = $true
+        
+        Update-Status "Monitoring..." "#FF4CAF50"
+        Write-Log "--- Monitoring started on $sourcePath (Filter: $fileFilter) ---"
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show("Failed to start monitor: $_", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
+})
+#endregion
+
+#region Button: Stop Monitoring
+$controls.StopButton.Add_Click({
+    Write-Log "--- Stopping monitor... ---"
+    
+    try {
+        if ($global:fileWatcher) {
+            $global:fileWatcher.EnableRaisingEvents = $false
+            $global:fileWatcher.Dispose()
+            $global:fileTwoWatcher = $null
+        }
+        
+        # Unregister all FileSystemWatcher and Job events
+        foreach ($subscriber in $global:eventSubscribers) {
+            Unregister-Event -SubscriptionId $subscriber.Id
+        }
+        $global:eventSubscribers = @()
+        
+        # Clean up any lingering jobs
+        Get-Job | Where-Object { $_.State -eq 'Running' } | Stop-Job
+        Get-Job | Remove-Job
+    }
+    catch {
+        Write-Log "Error during cleanup: $_"
+    }
+    
+    # Update GUI state
+    $controls.StartButton.IsEnabled = $true
+    $controls.StopButton.IsEnabled = $false
+    $controls.SourcePathBox.IsReadOnly = $false
+    $controls.FilterBox.IsReadOnly = $false
+    $controls.ServerListBox.IsReadOnly = $false
+    
+    Update-Status "Stopped" "#FFF44336"
+    Write-Log "--- Monitor stopped. ---"
+})
+#endregion
+
+#region Button: Clear Log
+$controls.ClearLogButton.Add_Click({
+    $controls.LogBox.Clear()
+})
+#endregion
+
+#region Form Closing Event
+$form.Add_Closing({
+    # Ensure monitoring is stopped and resources are released
+    if ($controls.StopButton.IsEnabled) {
+        $controls.StopButton.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+    }
+})
+#endregion
+
+#region Show GUI
+# Show the form
+Write-Host "Starting File Replication Monitor GUI..."
+$form.ShowDialog() | Out-Null
+#endregion
