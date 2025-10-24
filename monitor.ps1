@@ -64,8 +64,10 @@ function Ensure-ThreadJobModule {
                 }
                 catch {
                     # This catch block handles failures during the Install-PackageProvider step
-                    $errorMsg = "Failed to install the 'NuGet' provider. Error: $_`n`nCannot proceed with module installation. Please check your internet connection and try again."
-                    [System.Windows.Forms.MessageBox]::Show($errorMsg, "Installation Failed", [System.Windows.Forms.MessageBoxButtons::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                    # --- FIX 1: Made error message safer by getting Exception.Message ---
+                    $errorMsg = "Failed to install the 'NuGet' provider. Error: $($_.Exception.Message)`n`nCannot proceed with module installation. Please check your internet connection and try again."
+                    # --- FIX 2: Moved comma outside the ']' ---
+                    [System.Windows.Forms.MessageBox]::Show($errorMsg, "Installation Failed", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
                     return $false # Stop the function
                 }
                 # --- END NuGet Check ---
@@ -577,4 +579,5 @@ else {
 # Show the window
 $Window.ShowDialog() | Out-Null
 #endregion
+
 
