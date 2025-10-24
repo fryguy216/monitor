@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-#Requires -Modules @{ ModuleName = 'ThreadJob'; ModuleVersion = '2.0.3' }
+# No longer using #Requires for ThreadJob, as we will handle the dependency check manually.
 
 param(
     [string]$UNCPath = '\\FileServer\Share\Path',
@@ -7,6 +7,33 @@ param(
     [string]$FileFilter = '*.xml',
     [string]$HashAlgorithm = 'SHA256'
 )
+
+# --- Dependency Check for ThreadJob Module ---
+if (-not (Get-Module -ListAvailable -Name ThreadJob)) {
+    Write-Host "The 'ThreadJob' module is required for parallel operations but is not installed." -ForegroundColor Yellow
+    $prompt = Read-Host "Would you like to attempt to install it from the PowerShell Gallery? (Y/N)"
+    if ($prompt -match '^') {
+        try {
+            Write-Host "Installing 'ThreadJob' module for the current user. This may take a moment..." -ForegroundColor Green
+            # Install for the current user to avoid requiring admin rights
+            Install-Module -Name ThreadJob -Force -Scope CurrentUser
+            Write-Host "'ThreadJob' module installed successfully." -ForegroundColor Green
+        }
+        catch {
+            Write-Host "Error: Failed to install the 'ThreadJob' module." -ForegroundColor Red
+            Write-Host "Please ensure you have an internet connection and that your execution policy allows script installation." -ForegroundColor Red
+            Write-Host "You can try installing it manually by running: Install-Module -Name ThreadJob -Scope CurrentUser" -ForegroundColor Red
+            # Pause to allow the user to read the error before exiting.
+            Read-Host "Press Enter to exit."
+            exit
+        }
+    }
+    else {
+        Write-Host "Installation declined. The script cannot continue without the 'ThreadJob' module." -ForegroundColor Red
+        Read-Host "Press Enter to exit."
+        exit
+    }
+}
 
 # --- ---
 # The UI is defined using XAML for a clean separation of presentation and logic.
